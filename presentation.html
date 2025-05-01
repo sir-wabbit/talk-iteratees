@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>Title</title>
+    <meta charset="utf-8">
+    <style>
+      @import url(https://fonts.googleapis.com/css?family=Yanone+Kaffeesatz);
+      @import url(https://fonts.googleapis.com/css?family=Droid+Serif:400,700,400italic);
+      @import url(https://fonts.googleapis.com/css?family=Ubuntu+Mono:400,700,400italic);
+
+      body { font-family: 'Droid Serif'; }
+      h1, h2, h3 {
+        font-family: 'Yanone Kaffeesatz';
+        font-weight: normal;
+      }
+      .remark-code, .remark-inline-code { font-family: 'Ubuntu Mono'; }
+    </style>
+  </head>
+  <body>
+    <textarea id="source">
+
+class: center, middle
+
+# Introduction to Iteratees
+
+---
+
+## Standard Java7 I/O
+
+We often see something along the lines of:
+
+```scala
+def countWS(is: FileInputStream): Int = {
+  var count = 0
+  while (true) {
+    try {
+      val ch = is.read()
+      if (ch == -1) return 0
+      else if (Character.isSpaceChar(ch)) count += 1
+    } catch {
+      case NonFatal(e) => throw e
+    }
+  }
+  count
+}
+
+def run(f: File): Unit = {
+  try {
+    val is = new FileInputStream(f)
+    try {
+      println(javaCountWS(is))
+    } catch {
+      case NonFatal(e) => e.printStackTrace()
+    }
+    is.close()
+  } catch {
+    case NonFatal(e) => e.printStackTrace()
+  }
+}
+```
+
+---
+
+* Repetitive pattern
+* Manual pulling
+* Mutability, imperative style
+* Explicit error handling
+* Does not compose
+* Explicit resource handling
+
+---
+
+## Iterators
+
+Let's try to be a bit functional and invert control:
+
+```scala
+def countWS(is: Iterator[Char]): Int =
+  is.filter(_.isSpaceChar).map(_ => 1).sum
+
+def run(f: File): Unit = try {
+  val is = scala.io.Source.fromFile(f)
+  try {
+    println(iteratorCountWS(is.iter))
+  } catch {
+    case NonFatal(e) => e.printStackTrace()
+  }
+  is.close()
+} catch {
+  case NonFatal(e) => e.printStackTrace()
+}
+```
+
+---
+
+* Composable
+* Resource handling
+* Asynchronous operations?
+* Resumable operations?
+* Still imperative
+
+---
+
+## Lazy I/O
+
+This is just horrifyingly bad, never do this!
+
+```scala
+def countWS(is: Stream[Char]): Int =
+  is.filter(_.isSpaceChar).map(_ => 1).sum
+
+def run(f: File): Unit = try {
+  val is = scala.io.Source.fromFile(f)
+  try {
+    println(lazyCountWS(is.iter.toStream))
+  } catch {
+    case NonFatal(e) => e.printStackTrace()
+  }
+  is.close()
+} catch {
+  case NonFatal(e) => e.printStackTrace()
+}
+```
+
+---
+
+The curse of lazy I/O (one of):
+
+```scala
+def countWS(is: Stream[Char]): Int =
+  is.filter(_.isSpaceChar).map(_ => 1).sum
+```
+
+Unpredictable memory consumption because of memoization!
+
+---
+
+## Iteratees
+
+```scala
+import cats.Eval
+import cats.syntax.all._
+import cats.instances.int._
+import io.iteratee.Iteratee
+import io.iteratee.modules.eitherT._
+import io.iteratee.files.eitherT.readBytes
+
+type IO[A] = EitherT[Eval, Throwable, A]
+def readChars(file: File): Enumerator[IO, Char] =
+  readBytes(file).flatMap(b => enumIndexedSeq(b).map(_.toChar))
+
+def iterateeCountWS: Iteratee[IO, Char, Int] =
+  sum.through(filter[Char](_.isSpaceChar).map(_ => 1))
+
+def iterateeRun(file: File): Eval[Unit] =
+  readChars(file).into(iterateeCountWS).fold(
+    e => Eval.later(e.printStackTrace()),
+    x => Eval.later(println(x)))
+```
+
+---
+
+## Iteratees
+
+```scala
+sealed abstract class Iteratee[E, A]
+final case class Done[E, A](a: A) extends Iteratee[E, A]
+final case class Cont[E, A](k: Option[E] => Iteratee[E, A]) extends Iteratee[E, A]
+
+def empty[E, A](a: A): Iteratee[E, A] = Done(a)
+def failure[E, A]: Iteratee[E, A] = Cont(_ => failure)
+def maybeOne[E]: Iteratee[E, Option[E]] = Cont(x => Done(x))
+```
+
+* Easy to use (*)
+* Composable in sequence and in parallel
+* Tail recursion => no stack overflow
+* Thin layer => high performance
+* Good match for asynchronous environments, e.g. the play framework
+
+---
+
+Iteratees are (parser) monads:
+
+```scala
+new Monad[Iteratee[E, ?]] {
+  def pure[A](x: A): Iteratee[E, A] = empty(x)
+
+  def map[A, B](fa: Iteratee[E, A])(f: (A) => B): Iteratee[E, B] =
+    fa match {
+      case Done(a) => Done(f(a))
+      case Cont(k) => Cont(e => map(k(e))(f))
+    }
+
+  def flatMap[A, B](fa: Iteratee[E, A])(f: (A) => Iteratee[E, B]): Iteratee[E, B] =
+    fa match {
+      case Done(x) => f(x)
+      case Cont(k) => Cont(v => flatMap(k(v))(f))
+    }
+}
+```
+
+`a.flatMap(b)` is parser composition.
+
+---
+
+Example `Iteratee`s:
+
+```scala
+def sum[E](implicit M: Monoid[E]): Iteratee[E, E] = {
+  def go(acc: E): Iteratee[E, E] = Cont {
+    case None => Done(acc)
+    case Some(x) => go(M.combine(acc, x))
+  }
+  go(M.empty)
+}
+
+def empty[E, A](a: A): Iteratee[E, A] = Done(a)
+def failure[E, A]: Iteratee[E, A] = Cont(_ => failure)
+def maybeOne[E]: Iteratee[E, Option[E]] = Cont(x => Done(x))
+
+def one[E]: Iteratee[E, E] =
+  maybeOne[E].flatMap(_.fold(failure[E, E])(x => empty[E, E](x)))
+def sat[E](p: E => Boolean): Iteratee[E, E] =
+  one[E]flatMap(e => if (p(e)) empty(e) else failure)
+```
+
+---
+
+## Enumerators
+
+* Enumerators are stream producers:
+
+```scala
+trait Forall[F[_]] {
+  def apply[A]: F[A]
+}
+
+type Enumerator[E] = Forall[λ[A => Iteratee[E, A] => Iteratee[E, A]]]
+
+sealed abstract class Enumerator[E] {
+  def apply[A](it: Iteratee[E, A]): Iteratee[E, A]
+}
+```
+
+* They push chunks of data to an Iteratee (fold it over the input stream).
+* Can act asynchronously or synchronously.
+
+---
+
+Example `Enumerator`:
+
+```scala
+def enumList[E](list: List[E]): Enumerator[E] = {
+  @tailrec def go[A](list: List[E], it: Iteratee[E, A]): Iteratee[E, A] = list match {
+    case Nil => it
+    case x :: xs => it match {
+      case Done(a) => Done(a)
+      case Cont(k) => go(xs, k(Some(x)))
+    }
+  }
+
+  new Enumerator[E] {
+    override def apply[A](it: Iteratee[E, A]): Iteratee[E, A] = go(list, it)
+  }
+}
+```
+
+---
+
+## Enumeratees
+
+* Both consumers and producers
+* Link `Enumerator`s and `Iteratee`s
+* Feed transformed input from `Enumerator` to "inner" Iteratee,
+  - filter
+  - take
+  - ...
+* Form a category
+* Allow vertical (parallel) stacking of Iteratees (one to many).
+
+---
+
+More on Iteratees as parsers:
+
+```scala
+implicit class IterateeOps[E, A](val value: Iteratee[E, A]) extends AnyVal {
+  def <|(other: => Iteratee[E, A]): Iteratee[E, A] = value match {
+    case Done(a) => Done(a)
+    case Cont(k1) =>
+      other match {
+        case Done(a) => Done(a)
+        case Cont(k2) => Cont(x => k1(x) <| k2(x))
+      }
+  }
+}
+```
+
+`a <| b` recognizes whatever the first finishing parser recognizes; in
+the event of a tie, the result of `a` is preferred.
+
+Not possible with side-effects ;(
+---
+    </textarea>
+    <script src="https://gnab.github.io/remark/downloads/remark-latest.min.js">
+    </script>
+    <script>
+      var slideshow = remark.create();
+    </script>
+  </body>
+</html>
